@@ -19,4 +19,3 @@ streamlit run app.py
 - `procesamiento.py` — lectura, reemplazo de CAR y clasificación
 - `reportes.py` — generación de Excel y PDF
 # consumos_FSC_controlado
-# consumos_FSC_controlado
