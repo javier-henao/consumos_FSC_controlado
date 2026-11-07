@@ -10,9 +10,9 @@ import plotly.express as px
 import streamlit as st
 
 from procesamiento import (COLORES_CORTEZA, COLORES_FIBRA, SIN_ASIGNAR, cargar_config,
-                           colores_para, config_defecto, guardar_config, leer_excel, procesar,
-                           resumen_categoria, resumen_cruzado, resumen_mensual, resumen_pila,
-                           validar_config)
+                           colores_para, config_defecto, detectar_columnas, guardar_config,
+                           leer_tabla, normalizar, procesar, resumen_categoria, resumen_cruzado,
+                           resumen_mensual, resumen_pila, validar_config)
 from reportes import generar_excel, generar_pdf
 
 st.set_page_config(page_title="Consumos Picadora", page_icon="🌲", layout="wide")
@@ -22,11 +22,65 @@ if "config" not in st.session_state:
 
 
 @st.cache_data(show_spinner="Leyendo archivo…")
-def _leer(contenido: bytes, nombre: str) -> pd.DataFrame:
+def _leer_tabla(contenido: bytes, nombre: str) -> pd.DataFrame:
     import io
     f = io.BytesIO(contenido)
     f.name = nombre
-    return leer_excel(f)
+    return leer_tabla(f)
+
+
+@st.cache_data(show_spinner=False)
+def _normalizar(contenido: bytes, nombre: str, mapeo: tuple) -> pd.DataFrame:
+    return normalizar(_leer_tabla(contenido, nombre), dict(mapeo))
+
+
+CAMPOS_UI = {
+    "Producto": "Producto / tipo de fibra (DCR_PRODUTO_ORIGEM)",
+    "Fecha": "Fecha (DATA_INICIO)",
+    "Hora": "Hora (HORA_INICIO) — opcional",
+    "Pila": "Pila (NUM_PILHA_ORIGEM)",
+    "Peso": "Peso (Peso Líquido)",
+}
+NINGUNA = "(ninguna)"
+
+
+def obtener_datos():
+    """Lee el archivo, detecta las columnas y permite corregir la asignación a mano."""
+    if archivo is None:
+        return None
+    contenido = archivo.getvalue()
+    try:
+        tabla = _leer_tabla(contenido, archivo.name)
+    except Exception as e:
+        st.error(f"No se pudo leer el archivo: {e}")
+        return None
+
+    auto = detectar_columnas(tabla)
+    cols = [NINGUNA] + list(tabla.columns)
+    faltan_auto = [c for c in ("Producto", "Fecha", "Pila", "Peso") if c not in auto]
+    mapeo = {}
+    with st.sidebar.expander("🔗 Columnas del archivo", expanded=bool(faltan_auto)):
+        st.caption("Detectadas automáticamente. Cámbielas si alguna no corresponde.")
+        for campo, etiqueta in CAMPOS_UI.items():
+            actual = auto.get(campo, NINGUNA)
+            sel = st.selectbox(etiqueta, cols, index=cols.index(actual),
+                               key=f"map_{campo}_{archivo.name}_{archivo.size}")
+            if sel != NINGUNA:
+                mapeo[campo] = sel
+
+    faltan = [c for c in ("Producto", "Fecha", "Pila", "Peso") if c not in mapeo]
+    if faltan:
+        st.warning("No se identificaron estas columnas: **" + ", ".join(faltan) + "**. "
+                   "Selecciónelas en la barra lateral, en *🔗 Columnas del archivo*.")
+        st.caption("Primeras filas del archivo tal como se leyó:")
+        st.dataframe(tabla.head(15), width="stretch")
+        return None
+    try:
+        return _normalizar(contenido, archivo.name, tuple(sorted(mapeo.items())))
+    except Exception as e:
+        st.error(f"No se pudieron interpretar los datos con las columnas elegidas: {e}")
+        st.dataframe(tabla.head(15), width="stretch")
+        return None
 
 
 def _fmt(n, dec=0):
@@ -106,9 +160,10 @@ def pagina_config():
             st.error(f"Archivo inválido: {e}")
 
     # Vista previa con los datos cargados
-    if archivo is not None:
+    base = obtener_datos()
+    if base is not None:
         st.subheader("Vista previa: pilas por categoría con esta configuración")
-        df = procesar(_leer(archivo.getvalue(), archivo.name), nuevo)
+        df = procesar(base, nuevo)
         prev = (df.groupby(["Categoría", "Pila"], dropna=False)
                 .agg(Registros=("Toneladas", "size"), Toneladas=("Toneladas", "sum"))
                 .reset_index().sort_values(["Categoría", "Pila"]))
@@ -123,15 +178,21 @@ def pagina_config():
 def pagina_reporte():
     st.header("📊 Reporte de Consumos Picadora")
     if archivo is None:
-        st.info("Cargue el archivo Excel en la barra lateral. El nombre puede variar; "
-                "se requieren las columnas DCR_PRODUTO_ORIGEM, DATA_INICIO, HORA_INICIO, "
-                "NUM_PILHA_ORIGEM y Peso Líquido.")
+        st.info("Cargue el archivo Excel en la barra lateral. El nombre del archivo y de las "
+                "columnas puede variar: la app las detecta automáticamente y, si no puede, "
+                "le permite elegirlas.")
         return
-    try:
-        base = _leer(archivo.getvalue(), archivo.name)
-    except Exception as e:
-        st.error(f"No se pudo leer el archivo: {e}")
+    base = obtener_datos()
+    if base is None:
         return
+    if base.empty:
+        st.error("No se encontraron registros con fecha válida. Revise en la barra lateral "
+                 "que la columna de *Fecha* esté bien asignada.")
+        return
+    descartadas = base.attrs.get("filas_descartadas", 0)
+    if descartadas:
+        st.caption(f"ℹ️ Se omitieron {descartadas:,} filas sin fecha (separadores o subtotales "
+                   "del reporte de origen).")
     df = procesar(base, st.session_state.config)
 
     # ---------------- filtros

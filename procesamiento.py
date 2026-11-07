@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
 import re
+import unicodedata
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -12,13 +15,6 @@ import pandas as pd
 # En Railway, defina CONFIG_DIR apuntando a un volumen (ej. /data) para que la
 # configuración guardada sobreviva a los redespliegues.
 CONFIG_PATH = Path(os.environ.get("CONFIG_DIR", Path(__file__).parent)) / "config_asignaciones.json"
-
-# Sufijos de las columnas originales (el prefijo #VW_CUBO_DADOS_ITEM_BOLETIM. puede variar)
-COL_PRODUCTO = "DCR_PRODUTO_ORIGEM"
-COL_FECHA = "DATA_INICIO"
-COL_HORA = "HORA_INICIO"
-COL_PILA = "NUM_PILHA_ORIGEM"
-COL_PESO = "Peso Líquido"
 
 SIN_ASIGNAR = "Sin asignar"
 
@@ -119,35 +115,244 @@ def colores_para(categorias: list[str]) -> dict:
 
 
 # ----------------------------------------------------------------------------- datos
-def _buscar_columna(cols, sufijo):
-    for c in cols:
-        if str(c).strip().upper().endswith(sufijo.upper()):
-            return c
-    raise KeyError(f"No se encontró la columna que termina en '{sufijo}'.")
+# Campos que necesita la app y los nombres aceptados para cada uno (ya normalizados:
+# sin prefijo "TABLA.", sin tildes, sin espacios/guiones/símbolos, en mayúsculas).
+CAMPOS = {
+    "Producto": ["DCRPRODUTOORIGEM", "PRODUTOORIGEM", "DESCPRODUTOORIGEM", "PRODUCTOORIGEN",
+                 "DCRPRODUTO", "PRODUTO", "PRODUCTO", "DESCRIPCIONPRODUCTO", "TIPOFIBRA"],
+    "Fecha": ["DATAINICIO", "DATAINICIAL", "FECHAINICIO", "FECHAINICIAL", "DATA", "FECHA"],
+    "Hora": ["HORAINICIO", "HORAINICIAL", "HORA"],
+    "Pila": ["NUMPILHAORIGEM", "PILHAORIGEM", "NUMPILHA", "PILHA", "NUMPILAORIGEN",
+             "PILAORIGEN", "NUMPILA", "PILA"],
+    "Peso": ["PESOLIQUIDO", "PESONETO", "PESOLIQ", "PESO"],
+}
+# Palabras clave para coincidencias parciales, por si el nombre trae texto extra
+CLAVES = {
+    "Producto": ["PRODUT", "PRODUCT"],
+    "Fecha": ["DATA", "FECHA"],
+    "Hora": ["HORA"],
+    "Pila": ["PILHA", "PILA"],
+    "Peso": ["PESO"],
+}
+
+
+def normalizar_nombre(nombre) -> str:
+    s = str(nombre).strip()
+    if "." in s:                       # #VW_CUBO_DADOS_ITEM_BOLETIM.DCR_PRODUTO_ORIGEM -> DCR_PRODUTO_ORIGEM
+        s = s.rsplit(".", 1)[-1]
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+    return re.sub(r"[^A-Za-z0-9]", "", s).upper()
+
+
+def _puntaje_encabezado(valores) -> int:
+    """Cuántos campos se reconocen en una fila candidata a encabezado."""
+    nombres = [normalizar_nombre(v) for v in valores if pd.notna(v)]
+    return sum(any(n in alias for n in nombres) for alias in CAMPOS.values())
+
+
+def leer_tabla(archivo) -> pd.DataFrame:
+    """Lee el archivo (.xls, .xlsx, o .xls que en realidad es HTML) y ubica la fila de encabezados."""
+    nombre = getattr(archivo, "name", str(archivo)).lower()
+    datos = archivo.getvalue() if hasattr(archivo, "getvalue") else Path(archivo).read_bytes()
+
+    hojas = []
+    for engine in (("xlrd" if nombre.endswith(".xls") else "openpyxl"), None):
+        try:
+            hojas = list(pd.read_excel(io.BytesIO(datos), engine=engine, header=None,
+                                       sheet_name=None).values())
+            break
+        except Exception:
+            continue
+    if not hojas:  # algunos sistemas exportan HTML con extensión .xls
+        try:
+            hojas = []
+            for h in pd.read_html(io.BytesIO(datos)):
+                # read_html usa los <th> como nombres de columna: devolverlos a la 1a fila
+                # para que la búsqueda de encabezado funcione igual que en Excel.
+                nombres = [" ".join(map(str, c)) if isinstance(c, tuple) else c for c in h.columns]
+                h = pd.concat([pd.DataFrame([nombres]), pd.DataFrame(h.values)], ignore_index=True)
+                hojas.append(h)
+        except Exception as e:
+            raise ValueError(f"No se reconoce el formato del archivo: {e}") from e
+
+    # Elegir la hoja y la fila (entre las primeras 30) que más parece encabezado
+    mejor = (-1, None, 0)
+    for h in hojas:
+        for i in range(min(30, len(h))):
+            p = _puntaje_encabezado(h.iloc[i].tolist())
+            if p > mejor[0]:
+                mejor = (p, h, i)
+    puntaje, hoja, fila = mejor
+    if hoja is None:
+        raise ValueError("El archivo está vacío.")
+    if puntaje == 0:   # sin encabezado reconocible: usar la primera fila
+        fila = 0
+    tabla = hoja.iloc[fila + 1:].reset_index(drop=True)
+    tabla.columns = _nombres_unicos(hoja.iloc[fila].tolist())
+    tabla = tabla.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    return tabla.reset_index(drop=True)
+
+
+def _nombres_unicos(nombres):
+    vistos, out = {}, []
+    for i, n in enumerate(nombres):
+        n = str(n).strip() if pd.notna(n) and str(n).strip() else f"Columna {i + 1}"
+        if n in vistos:
+            vistos[n] += 1
+            n = f"{n} ({vistos[n]})"
+        else:
+            vistos[n] = 0
+        out.append(n)
+    return out
+
+
+def detectar_columnas(tabla: pd.DataFrame) -> dict:
+    """Devuelve {campo: nombre_de_columna}. Busca por nombre y, si no, por contenido."""
+    norm = {c: normalizar_nombre(c) for c in tabla.columns}
+    asignadas, res = set(), {}
+
+    # 1) nombre exacto (en orden de preferencia)  2) nombre que contiene la palabra clave
+    for campo, alias in CAMPOS.items():
+        for a in alias:
+            c = next((c for c, n in norm.items() if n == a and c not in asignadas), None)
+            if c:
+                res[campo] = c; asignadas.add(c); break
+    for campo, claves in CLAVES.items():
+        if campo in res:
+            continue
+        c = next((c for c, n in norm.items() if c not in asignadas
+                  and any(k in n for k in claves)), None)
+        if c:
+            res[campo] = c; asignadas.add(c)
+
+    # 3) por contenido
+    libres = [c for c in tabla.columns if c not in asignadas]
+    muestra = {c: tabla[c].dropna().head(300) for c in libres}
+
+    def frac(c, fn):
+        s = muestra[c]
+        return fn(s).mean() if len(s) else 0
+
+    pruebas = {
+        "Producto": lambda s: s.astype(str).str.upper().str.contains("FIBRA|CRT"),
+        "Pila": lambda s: s.astype(str).str.strip().str.upper().str.fullmatch(
+            r"\d{3,4}(\.0)?|CAR|[TR]\d{3}|(EU|PN) CAR.*"),
+        "Hora": lambda s: s.astype(str).str.strip().str.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?"),
+        "Fecha": lambda s: _a_fecha(s).notna()
+                           & ~s.astype(str).str.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?|\d+(\.\d+)?"),
+        "Peso": lambda s: pd.to_numeric(s.astype(str).str.replace(r"[.,\s]", "", regex=True),
+                                        errors="coerce").notna(),
+    }
+    for campo in ["Producto", "Hora", "Fecha", "Pila", "Peso"]:
+        if campo in res:
+            continue
+        cand = [(frac(c, pruebas[campo]), c) for c in libres if c not in asignadas]
+        cand = [x for x in cand if x[0] >= 0.8]
+        if cand:
+            c = max(cand)[1]
+            res[campo] = c; asignadas.add(c)
+    return res
+
+
+def normalizar(tabla: pd.DataFrame, mapeo: dict) -> pd.DataFrame:
+    """Convierte la tabla original al formato interno usando el mapeo de columnas."""
+    faltan = [c for c in ("Producto", "Fecha", "Pila", "Peso") if not mapeo.get(c)]
+    if faltan:
+        raise KeyError("Faltan columnas: " + ", ".join(faltan))
+    col = lambda k: tabla[mapeo[k]] if mapeo.get(k) else pd.Series(pd.NA, index=tabla.index)
+
+    df = pd.DataFrame({
+        "Producto": col("Producto"),
+        "Fecha": _a_fecha(col("Fecha")),
+        "Hora": col("Hora"),
+        "Pila original": col("Pila"),
+        "Peso Líquido": _a_numero(col("Peso")),
+    })
+    df["Producto"] = df["Producto"].astype("string").str.strip().replace("", pd.NA)
+    # Reportes agrupados: el producto solo viene en la primera fila del grupo
+    con_dato = df["Fecha"].notna()
+    if df.loc[con_dato, "Producto"].isna().mean() > 0.2:
+        df["Producto"] = df["Producto"].ffill()
+    # Filas sin fecha = separadoras o subtotales de reportes agrupados: se descartan
+    # para no sumar dos veces. Se guarda cuántas fueron para mostrarlo en la app.
+    descartadas = int((~con_dato).sum())
+    df = df[con_dato]
+    df = df[~df["Producto"].fillna("").str.upper().str.startswith("TOTAL")]
+    df["Pila original"] = df["Pila original"].map(_normalizar_pila)
+    df["Hora"] = df["Hora"].map(_a_hora).astype("string")
+    if df["Hora"].isna().all():
+        df["Hora"] = df["Fecha"].dt.strftime("%H:%M").astype("string")
+    df = df.reset_index(drop=True)
+    df.attrs["filas_descartadas"] = descartadas
+    return df
+
+
+def _a_fecha(s: pd.Series) -> pd.Series:
+    """Convierte a fecha aceptando: fechas de Excel, números seriales, texto ISO
+    (2026-01-13 00:01) y texto día/mes/año (13/01/2026 00:01)."""
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    es_fecha = s.map(lambda v: isinstance(v, (datetime, date)) and not pd.isna(v))
+    if es_fecha.any():
+        out[es_fecha] = pd.to_datetime(s[es_fecha].tolist(), errors="coerce")
+    resto = s[~es_fecha & s.notna()]
+    num = pd.to_numeric(resto, errors="coerce")
+    serial = num.between(20000, 80000)                     # fecha serial de Excel
+    if serial.any():
+        out[serial[serial].index] = pd.to_datetime(num[serial], unit="D", origin="1899-12-30")
+    txt = resto[num.isna()].astype(str).str.strip()
+    # Solo se interpreta texto con forma de fecha real (evita que "T330" se lea como año 330)
+    iso = txt.str.match(r"^\d{4}-\d{1,2}-\d{1,2}([ T]\d{1,2}:\d{2}(:\d{2})?)?(\.\d+)?$")
+    dmy = txt.str.match(r"^\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}( \d{1,2}:\d{2}(:\d{2})?)?$")
+    for mascara, kw in ((iso, dict(format="ISO8601")),                # 2026-01-13 00:01
+                        (dmy, dict(dayfirst=True, format="mixed"))):  # 13/01/2026 00:01
+        if mascara.any():
+            v = pd.to_datetime(txt[mascara], errors="coerce", **kw)
+            out[v.index] = v.astype("datetime64[ns]")
+    return out
+
+
+def _a_numero(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce").fillna(0)
+
+    def conv(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        t = re.sub(r"[^\d,.\-]", "", str(v))
+        if "," in t and "." in t:                             # 1.234,56 o 1,234.56
+            t = t.replace(".", "").replace(",", ".") if t.rfind(",") > t.rfind(".") \
+                else t.replace(",", "")
+        elif "," in t:
+            t = t.replace(",", "") if re.fullmatch(r"-?\d{1,3}(,\d{3})+", t) else t.replace(",", ".")
+        elif re.fullmatch(r"-?\d{1,3}(\.\d{3})+", t):         # 962.080 -> 962080
+            t = t.replace(".", "")
+        try:
+            return float(t)
+        except ValueError:
+            return 0.0
+    return s.map(conv)
+
+
+def _a_hora(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return pd.NA
+    if hasattr(v, "strftime"):
+        return v.strftime("%H:%M")
+    if isinstance(v, float) and 0 <= v < 1:                  # fracción de día de Excel
+        m = round(v * 24 * 60)
+        return f"{m // 60:02d}:{m % 60:02d}"
+    s = str(v).strip()
+    return s or pd.NA
 
 
 def leer_excel(archivo) -> pd.DataFrame:
-    """Lee .xls/.xlsx sin importar el nombre del archivo y normaliza las columnas."""
-    nombre = getattr(archivo, "name", str(archivo)).lower()
-    engine = "xlrd" if nombre.endswith(".xls") else None
-    try:
-        raw = pd.read_excel(archivo, engine=engine)
-    except Exception:
-        if hasattr(archivo, "seek"):
-            archivo.seek(0)
-        raw = pd.read_excel(archivo)
-    cols = list(raw.columns)
-    df = pd.DataFrame({
-        "Producto": raw[_buscar_columna(cols, COL_PRODUCTO)],
-        "Fecha": pd.to_datetime(raw[_buscar_columna(cols, COL_FECHA)], errors="coerce"),
-        "Hora": raw[_buscar_columna(cols, COL_HORA)],
-        "Pila original": raw[_buscar_columna(cols, COL_PILA)],
-        "Peso Líquido": pd.to_numeric(raw[_buscar_columna(cols, COL_PESO)], errors="coerce").fillna(0),
-    })
-    df["Producto"] = df["Producto"].astype("string").str.strip()
-    df["Pila original"] = df["Pila original"].map(_normalizar_pila)
-    df["Hora"] = df["Hora"].astype("string").str.strip()
-    return df
+    """Lectura automática completa (sin intervención del usuario)."""
+    tabla = leer_tabla(archivo)
+    return normalizar(tabla, detectar_columnas(tabla))
 
 
 def _normalizar_pila(v):
