@@ -44,9 +44,11 @@ CONFIG_DEFECTO = {
          "codigos": "EU CAR MEN, EU CAR MENOR, EU CAR MAY, T330, R331",
          "notas": "Incluye Patio Oriente (305)"},
         {"categoria": "Pino Controlado", "rango_min": 200, "rango_max": 299,
-         "codigos": "PN CAR CNT, T208, R209, T218, R219", "notas": ""},
+         "codigos": "PN CAR CNT, PN CAR CONTROL, T208, R209, T218, R219", "notas": ""},
         {"categoria": "Pino FSC", "rango_min": 400, "rango_max": 499,
          "codigos": "PN CAR MEN, PN CAR MAY, T428, R429", "notas": ""},
+        {"categoria": "Orillos", "rango_min": None, "rango_max": None,
+         "codigos": "2000", "notas": "Pila 2000"},
     ],
 }
 

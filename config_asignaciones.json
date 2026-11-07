@@ -1,0 +1,61 @@
+{
+  "categorias": [
+    {
+      "categoria": "Eucalipto Controlado",
+      "rango_min": 100,
+      "rango_max": 199,
+      "codigos": "EU CAR CNT, T168, R169, T178, R179",
+      "notas": ""
+    },
+    {
+      "categoria": "Eucalipto FSC",
+      "rango_min": 300,
+      "rango_max": 399,
+      "codigos": "EU CAR MEN, EU CAR MENOR, EU CAR MAY, T330, R331",
+      "notas": "Incluye Patio Oriente (305)"
+    },
+    {
+      "categoria": "Pino Controlado",
+      "rango_min": 200,
+      "rango_max": 299,
+      "codigos": "PN CAR CNT, PN CAR CONTROL, T208, R209, T218, R219",
+      "notas": ""
+    },
+    {
+      "categoria": "Pino FSC",
+      "rango_min": 400,
+      "rango_max": 499,
+      "codigos": "PN CAR MEN, PN CAR MAY, T428, R429",
+      "notas": ""
+    },
+    {
+      "categoria": "Orillos",
+      "rango_min": 2000,
+      "rango_max": 2000,
+      "codigos": "2000",
+      "notas": "Pila 2000"
+    }
+  ],
+  "reemplazos": [
+    {
+      "pila_original": "CAR",
+      "producto": "Fibra Corta CON CRT",
+      "nuevo_valor": "EU CAR MENOR"
+    },
+    {
+      "pila_original": "CAR",
+      "producto": "Fibra Corta SIN CRT",
+      "nuevo_valor": "EU CAR MENOR"
+    },
+    {
+      "pila_original": "CAR",
+      "producto": "Fibra Larga CON CRT",
+      "nuevo_valor": "PN CAR MEN"
+    },
+    {
+      "pila_original": "CAR",
+      "producto": "Fibra Larga SIN CRT",
+      "nuevo_valor": "PN CAR MEN"
+    }
+  ]
+}

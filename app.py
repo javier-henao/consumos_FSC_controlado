@@ -211,11 +211,15 @@ def pagina_reporte():
     sel_cat = st.sidebar.multiselect("Categoría", todas_cat,
                                      [c for c in todas_cat if c != SIN_ASIGNAR])
     tipos = sorted(df["Tipo de fibra"].unique())
-    sel_tipo = st.sidebar.multiselect("Tipo de fibra", tipos,
-                                      [t for t in tipos if t != "Otro"] or tipos)
+    # Todo marcado por defecto: productos como "Orillo Para Saco Poroso FL" (pila 2000)
+    # no son Fibra Corta/Larga ni tienen corteza, y no deben quedar fuera del total.
+    sel_tipo = st.sidebar.multiselect("Tipo de fibra", tipos, tipos,
+                                      help="'Otro' = productos que no son Fibra Corta ni "
+                                           "Fibra Larga (por ejemplo, orillos).")
     cortezas = sorted(df["Corteza"].unique())
-    sel_crt = st.sidebar.multiselect("Corteza", cortezas,
-                                     [c for c in cortezas if c != "N/A"] or cortezas)
+    sel_crt = st.sidebar.multiselect("Corteza", cortezas, cortezas,
+                                     help="'N/A' = productos sin indicación CON/SIN CRT "
+                                          "(por ejemplo, orillos).")
     prods = sorted(df["Producto"].dropna().unique())
     sel_prod = st.sidebar.multiselect("Producto (opcional)", prods, [])
     excluir_cero = st.sidebar.checkbox("Excluir registros con peso 0", True)
